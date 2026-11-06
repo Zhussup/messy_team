@@ -21,6 +21,7 @@ CREATE TABLE IF NOT EXISTS agents(
   model TEXT NOT NULL,
   kind TEXT NOT NULL DEFAULT 'worker',
   system_prompt TEXT NOT NULL DEFAULT '',
+  tools_enabled INTEGER NOT NULL DEFAULT 1,
   created_at TEXT NOT NULL DEFAULT (datetime('now')),
   UNIQUE(session_id, name)
 );
@@ -50,6 +51,7 @@ CREATE TABLE IF NOT EXISTS messages(
   content TEXT NOT NULL DEFAULT '',
   thinking TEXT NOT NULL DEFAULT '',
   tool_calls TEXT,
+  is_tool_round INTEGER NOT NULL DEFAULT 0,
   reply_to INTEGER,
   created_at TEXT NOT NULL DEFAULT (datetime('now'))
 );
@@ -82,6 +84,29 @@ class Database:
         with self._lock:
             self._conn.executescript(_SCHEMA)
             self._conn.commit()
+        self._migrate()
+
+    def _migrate(self) -> None:
+        with self._lock:
+            version = self._conn.execute("PRAGMA user_version").fetchone()[0]
+            if version < 1:
+                columns = lambda table: {  # noqa: E731
+                    row[1] for row in self._conn.execute(
+                        f"PRAGMA table_info({table})"
+                    )
+                }
+                if "is_tool_round" not in columns("messages"):
+                    self._conn.execute(
+                        "ALTER TABLE messages"
+                        " ADD COLUMN is_tool_round INTEGER NOT NULL DEFAULT 0"
+                    )
+                if "tools_enabled" not in columns("agents"):
+                    self._conn.execute(
+                        "ALTER TABLE agents"
+                        " ADD COLUMN tools_enabled INTEGER NOT NULL DEFAULT 1"
+                    )
+                self._conn.execute("PRAGMA user_version = 1")
+                self._conn.commit()
 
     def close(self) -> None:
         with self._lock:
@@ -237,6 +262,13 @@ class Database:
                 "SELECT * FROM chats WHERE id=?", (chat_id,)
             ).fetchone()
 
+    def set_chat_perm_mode(self, chat_id: int, mode: str) -> None:
+        with self._lock:
+            self._conn.execute(
+                "UPDATE chats SET perm_mode=? WHERE id=?", (mode, chat_id)
+            )
+            self._conn.commit()
+
     def chat_agent(self, chat_id: int) -> sqlite3.Row | None:
         """The agent a DM is addressed to, or the first member of a group."""
         with self._lock:
@@ -272,15 +304,43 @@ class Database:
         content: str,
         thinking: str = "",
         tool_calls: str | None = None,
+        is_tool_round: int = 0,
     ) -> int:
         with self._lock:
             cur = self._conn.execute(
                 "INSERT INTO messages(chat_id, author, agent_id, content, thinking,"
-                " tool_calls) VALUES(?,?,?,?,?,?)",
-                (chat_id, author, agent_id, content, thinking, tool_calls),
+                " tool_calls, is_tool_round) VALUES(?,?,?,?,?,?,?)",
+                (chat_id, author, agent_id, content, thinking, tool_calls,
+                 is_tool_round),
             )
             self._conn.commit()
             return int(cur.lastrowid)
+
+    # tool calls -----------------------------------------------------------
+
+    def insert_tool_call(
+        self,
+        message_id: int,
+        name: str,
+        args_json: str,
+        status: str,
+        result: str | None,
+    ) -> int:
+        with self._lock:
+            cur = self._conn.execute(
+                "INSERT INTO tool_calls(message_id, name, args, status, result)"
+                " VALUES(?,?,?,?,?)",
+                (message_id, name, args_json, status, result),
+            )
+            self._conn.commit()
+            return int(cur.lastrowid)
+
+    def list_tool_calls(self, message_id: int) -> list[sqlite3.Row]:
+        with self._lock:
+            return self._conn.execute(
+                "SELECT * FROM tool_calls WHERE message_id=? ORDER BY id",
+                (message_id,),
+            ).fetchall()
 
     _MESSAGE_JOIN = (
         "SELECT m.*, a.name AS agent_name, a.model AS agent_model"

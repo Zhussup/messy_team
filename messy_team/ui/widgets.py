@@ -1,12 +1,22 @@
-"""Feed widgets: message views and streaming messages."""
+"""Feed widgets: message views, streaming messages and tool cards."""
 
 from __future__ import annotations
 
+import json
+
+from rich.text import Text
 from textual.app import ComposeResult
 from textual.containers import Vertical
-from textual.widgets import Markdown, Static
+from textual.widgets import Collapsible, Markdown, Static
 
 from ..agent import Event
+
+_STATUS_SYMBOL = {"done": "✓", "failed": "✗", "denied": "⊘"}
+
+
+def _safe_title(text: str) -> str:
+    # Collapsible titles render through markup; keep brackets out.
+    return text.replace("[", "(").replace("]", ")")
 
 
 class MessageView(Vertical):
@@ -85,3 +95,42 @@ class StreamingMessage(MessageView):
         parent = self.parent
         if parent is not None:
             parent.scroll_end(animate=False)
+
+
+class ToolCard(Collapsible):
+    """A finished tool call: header shows the outcome, body args and result."""
+
+    RESULT_CAP = 2_000
+
+    def __init__(self, tool_name: str, arguments: dict, status: str = "pending",
+                 result: str | None = None) -> None:
+        self._detail = Static("pending…", classes="tool-detail")
+        super().__init__(
+            self._detail,
+            title=f"⚙ {tool_name}",
+            collapsed=True,
+            classes="tool-card",
+        )
+        self._tool = tool_name
+        self.set_result(status, result, arguments)
+
+    @classmethod
+    def from_record(cls, record) -> "ToolCard":
+        try:
+            arguments = json.loads(record["args"])
+            if not isinstance(arguments, dict):
+                arguments = {"args": arguments}
+        except (json.JSONDecodeError, TypeError):
+            arguments = {"args": record["args"]}
+        return cls(record["name"], arguments, record["status"], record["result"])
+
+    def set_result(self, status: str, result: str | None,
+                   arguments: dict | None = None) -> None:
+        summary = " ".join(
+            str(v).replace("\n", " ") for v in (arguments or {}).values()
+        )[:44]
+        self.title = f"{_STATUS_SYMBOL.get(status, '?')} ⚙ {self._tool} {summary}".rstrip()
+        self._detail.update(Text(
+            f"args: {json.dumps(arguments or {}, ensure_ascii=False, indent=2)}\n\n"
+            f"result: {(result or '—')[: self.RESULT_CAP]}"
+        ))

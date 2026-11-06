@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import asyncio
+import json
 import re
 from dataclasses import dataclass
 
@@ -14,14 +16,17 @@ from textual.widgets import Footer, Header, ListItem, ListView, Static, TextArea
 
 from ..agent import (
     LEAD_DEFAULT_PROMPT,
+    TOOL_INSTRUCTIONS,
     WORKER_DEFAULT_PROMPT,
-    run_chat_turn,
+    run_agent_turn,
 )
 from ..config import Config
 from ..db import Database
 from ..ollama import ApiError, OllamaClient
-from .modals import AgentManagerModal, GroupModal, SessionModal
-from .widgets import MessageView, StreamingMessage
+from ..permissions import ASK, ALLOW, DENY, Permissions
+from ..tools import TOOLS_SPEC, ToolError, ToolExecutor
+from .modals import AgentManagerModal, GroupModal, PermissionModal, SessionModal
+from .widgets import MessageView, StreamingMessage, ToolCard
 
 
 class Composer(TextArea):
@@ -72,6 +77,7 @@ class MessyTeamApp(App[None]):
     BINDINGS = [
         Binding("ctrl+s", "sessions", "Sessions"),
         Binding("ctrl+n", "agents", "Agents"),
+        Binding("ctrl+p", "tools_mode", "Permission mode"),
         Binding("ctrl+q", "quit", "Quit", priority=True),
         Binding("ctrl+l", "feed_to_bottom", "Scroll to bottom"),
     ]
@@ -84,6 +90,7 @@ class MessyTeamApp(App[None]):
         self.session_id: int | None = None
         self.chat_id: int | None = None
         self._open_stream: StreamingMessage | None = None
+        self.permissions = Permissions()
 
     # -- client ------------------------------------------------------------
 
@@ -199,15 +206,44 @@ class MessyTeamApp(App[None]):
     def _open_chat(self, chat_id: int) -> None:
         self._abort_stream()
         self.chat_id = chat_id
-        chat = self.db.get_chat(chat_id)
-        icon = "@" if chat["kind"] == "dm" else "#"
-        self.query_one("#chat-title", Static).update(f"{icon} {chat['title']}")
+        self._chat_title_refresh()
         feed = self._feed()
         feed.remove_children()
         for message in self.db.list_messages(chat_id):
             view = self._view_for_message(message)
             feed.mount(view)
+            if message["is_tool_round"]:
+                for call in self.db.list_tool_calls(message["id"]):
+                    feed.mount(ToolCard.from_record(call))
         feed.scroll_end(animate=False)
+
+    def _chat_title_refresh(self) -> None:
+        if self.chat_id is None:
+            return
+        chat = self.db.get_chat(self.chat_id)
+        icon = "@" if chat["kind"] == "dm" else "#"
+        labels = {
+            "ask": "tools: ask",
+            "allow": "tools: allow all",
+            "readonly": "tools: read-only",
+        }
+        label = labels.get(chat["perm_mode"], "tools: ask")
+        self.query_one("#chat-title", Static).update(
+            f"{icon} {chat['title']}  ·  {label}"
+        )
+
+    def action_tools_mode(self) -> None:
+        """Ctrl+P: cycle the current chat's permission mode."""
+        if self.chat_id is None:
+            self.notify("Open a chat first", severity="warning")
+            return
+        chat = self.db.get_chat(self.chat_id)
+        order = ["ask", "allow", "readonly"]
+        current = chat["perm_mode"] if chat["perm_mode"] in order else "ask"
+        mode = order[(order.index(current) + 1) % len(order)]
+        self.db.set_chat_perm_mode(self.chat_id, mode)
+        self._chat_title_refresh()
+        self.notify(f"Tool permission mode: {mode}")
 
     def _view_for_message(self, message) -> MessageView:
         if message["author"] == "user":
@@ -360,7 +396,7 @@ class MessyTeamApp(App[None]):
     def _turn_history(self, chat_id: int) -> list[dict[str, str]]:
         history: list[dict[str, str]] = []
         for message in self.db.list_messages(chat_id):
-            if not message["content"]:
+            if message["is_tool_round"] or not message["content"]:
                 continue
             role = "user" if message["author"] == "user" else "assistant"
             history.append({"role": role, "content": message["content"]})
@@ -372,34 +408,134 @@ class MessyTeamApp(App[None]):
         except ApiError as error:
             self._render_notice(str(error))
             return
+        session = self.db.get_session(self.session_id)
+        chat = self.db.get_chat(chat_id)
+        try:
+            executor = ToolExecutor(session["cwd"])
+        except ToolError as error:
+            self._render_notice(f"Workspace problem: {error}")
+            return
         for agent in responders:
             if agent is None:
                 continue
-            stream = StreamingMessage(agent["name"], model=agent["model"])
-            feed = self._feed()
-            feed.mount(stream)
-            feed.scroll_end(animate=False)
-            self._open_stream = stream
-            history = self._turn_history(chat_id)
-            try:
-                final = await run_chat_turn(
-                    client, agent["model"], agent["system_prompt"], history,
-                    stream.write_event,
-                )
-            except ApiError as error:
-                stream.mark_error(str(error))
-                self._open_stream = None
-                break  # stop the chain, e.g. on rate limits
-            except Exception as error:  # surface bugs without killing the app
-                stream.mark_error(f"unexpected: {error!r}")
-                self._open_stream = None
-                continue
-            stream.finalize(final["content"], final["thinking"])
-            self.db.append_message(
-                chat_id, "agent", agent["id"], final["content"],
-                thinking=final["thinking"],
+            await self._agent_respond(
+                client, chat_id, agent, executor, chat["perm_mode"]
             )
+
+    async def _agent_respond(self, client: OllamaClient, chat_id: int, agent,
+                             executor: ToolExecutor, perm_mode: str) -> None:
+        """One full responding turn for one agent, with tool rounds."""
+        state: dict = {"stream": None, "msg_id": None}
+
+        def ensure_stream() -> StreamingMessage:
+            if state["stream"] is None:
+                stream = StreamingMessage(agent["name"], model=agent["model"])
+                feed = self._feed()
+                feed.mount(stream)
+                feed.scroll_end(animate=False)
+                state["stream"] = stream
+                self._open_stream = stream
+            return state["stream"]
+
+        def write_event(event: dict) -> None:
+            if event["type"] == "round_end":
+                if state["stream"] is not None:
+                    state["stream"].finalize(event["content"], event["thinking"])
+                state["stream"] = None
+                state["msg_id"] = self.db.append_message(
+                    chat_id, "agent", agent["id"], event["content"],
+                    event["thinking"],
+                    tool_calls=json.dumps(event["tool_calls"]),
+                    is_tool_round=1,
+                )
+                return
+            ensure_stream().write_event(event)
+
+        async def on_tool_call(call: dict) -> str:
+            name = call["function"]["name"]
+            arguments = call["function"]["arguments"]
+            if state["msg_id"] is None:
+                state["msg_id"] = self.db.append_message(
+                    chat_id, "agent", agent["id"], "", "",
+                    tool_calls=json.dumps([call]), is_tool_round=1,
+                )
+            message_id = state["msg_id"]
+
+            decision = self.permissions.decide(chat_id, perm_mode, name)
+            if decision == ASK:
+                choice = await self._await_approval(agent["name"], name, arguments)
+                if choice == "always":
+                    self.permissions.grant(chat_id, name)
+                    decision = ALLOW
+                elif choice == "deny":
+                    decision = DENY
+            if decision == DENY:
+                status, result = "denied", "user denied this tool call"
+            else:
+                try:
+                    result = await executor.execute(name, arguments)
+                    status = "done"
+                except ToolError as error:
+                    result, status = f"ERROR: {error}", "failed"
+
+            feed = self._feed()
+            card = ToolCard(name, arguments)
+            card.set_result(status, result, arguments)
+            feed.mount(card)
+            feed.scroll_end(animate=False)
+            self.db.insert_tool_call(
+                message_id, name, json.dumps(arguments, ensure_ascii=False),
+                status, result,
+            )
+            return result
+
+        system_prompt = agent["system_prompt"] + "\n\n" + TOOL_INSTRUCTIONS.format(
+            workspace=self.db.get_session(self.session_id)["cwd"]
+        )
+        try:
+            final = await run_agent_turn(
+                client, agent["model"], system_prompt,
+                self._turn_history(chat_id), TOOLS_SPEC if agent["tools_enabled"]
+                else None,
+                write_event, on_tool_call,
+            )
+        except ApiError as error:
+            ensure_stream().mark_error(str(error))
             self._open_stream = None
+            return
+        except Exception as error:  # surface bugs without killing the app
+            ensure_stream().mark_error(f"unexpected: {error!r}")
+            self._open_stream = None
+            return
+
+        content, thinking = final.get("content", ""), final.get("thinking", "")
+        if final.get("budget_hit"):
+            # The turn was cut off while the model kept requesting tools.
+            ensure_stream().finalize(content, thinking)
+            self.db.append_message(
+                chat_id, "agent", agent["id"], content, thinking,
+                tool_calls=json.dumps(final.get("tool_calls", [])),
+                is_tool_round=1,
+            )
+            self._render_notice("Turn stopped at the tool-round budget")
+            self._open_stream = None
+            return
+        if content or thinking:
+            ensure_stream().finalize(content, thinking)
+            self.db.append_message(chat_id, "agent", agent["id"], content, thinking)
+        self._open_stream = None
+
+    async def _await_approval(self, agent_name: str, tool: str,
+                              arguments: dict) -> str:
+        """Show the permission modal and wait for the user's choice."""
+        future = asyncio.get_running_loop().create_future()
+
+        def on_choice(choice: str | None) -> None:
+            if not future.done():
+                future.set_result(choice or "deny")
+
+        self.push_screen(PermissionModal(agent_name, tool, arguments), on_choice)
+        return await future
 
     def _abort_stream(self) -> None:
         if self._open_stream is not None:

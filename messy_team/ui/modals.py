@@ -2,8 +2,10 @@
 
 from __future__ import annotations
 
+import json
 import os
 
+from rich.text import Text
 from textual.app import ComposeResult
 from textual.binding import Binding
 from textual.containers import Horizontal, Vertical
@@ -262,6 +264,53 @@ class AgentManagerModal(ModalScreen[bool]):
 
 # Group result: None or ("create", title, agent_ids).
 GroupResult = None | tuple[str, str, list[int]]
+
+
+class PermissionModal(ModalScreen[str]):
+    """Approve a tool call. Returns "once", "always" or "deny"."""
+
+    CSS = """
+    PermissionModal { align: center middle; }
+    #perm-dialog {
+        width: 72; height: auto; max-height: 85%;
+        border: round $warning; background: $surface; padding: 1 2;
+    }
+    #perm-dialog .title { text-style: bold; margin-bottom: 1; }
+    #perm-dialog .sub { color: $text-muted; }
+    #perm-dialog .tool-name { color: $warning; text-style: bold; margin-bottom: 1; }
+    #perm-dialog .args {
+        border: round $surface-lighten-2; padding: 0 1; margin-bottom: 1;
+    }
+    #perm-dialog .btns { height: auto; align: right middle; }
+    #perm-dialog Button { margin-left: 2; }
+    """
+
+    BINDINGS = [Binding("escape", "deny", "Deny")]
+
+    def __init__(self, agent_name: str, tool: str, arguments: dict) -> None:
+        super().__init__()
+        self._agent_name = agent_name
+        self._tool = tool
+        self._arguments = arguments
+
+    def compose(self) -> ComposeResult:
+        with Vertical(id="perm-dialog"):
+            yield Static("Permission required", classes="title")
+            yield Static(f"{self._agent_name} wants to run", classes="sub")
+            yield Static(Text(self._tool, style="bold"), classes="tool-name")
+            yield Static(Text(json.dumps(self._arguments, ensure_ascii=False,
+                                         indent=2)[:2500]), classes="args")
+            with Horizontal(classes="btns"):
+                yield Button("Deny", id="btn-deny", variant="error")
+                yield Button("Always in this chat", id="btn-always")
+                yield Button("Allow once", id="btn-once", variant="primary")
+
+    def action_deny(self) -> None:
+        self.dismiss("deny")
+
+    def on_button_pressed(self, event: Button.Pressed) -> None:
+        mapping = {"btn-deny": "deny", "btn-always": "always", "btn-once": "once"}
+        self.dismiss(mapping.get(event.button.id or "", "deny"))
 
 
 class GroupModal(ModalScreen[GroupResult]):
