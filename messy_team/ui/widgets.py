@@ -1,0 +1,87 @@
+"""Feed widgets: message views and streaming messages."""
+
+from __future__ import annotations
+
+from textual.app import ComposeResult
+from textual.containers import Vertical
+from textual.widgets import Markdown, Static
+
+from ..agent import Event
+
+
+class MessageView(Vertical):
+    """One rendered message in the feed: an author line and a markdown body."""
+
+    def __init__(self, who: str, model: str | None = None, classes: str = "") -> None:
+        super().__init__(classes=f"msg {classes}".strip())
+        kind = "who-me" if "me" in classes.split() else "who-agent"
+        label = who + (f" · {model}" if model else "")
+        self.who = Static(label, classes=f"who {kind}")
+        self.thinking_line = Static("✻ thinking…", classes="thinking")
+        self.thinking_line.display = False
+        self.body = Markdown("", classes="body")
+
+    def compose(self) -> ComposeResult:
+        yield self.who
+        yield self.thinking_line
+        yield self.body
+
+    def set_body(self, text: str) -> None:
+        self.body.update(text or "*— no content —*")
+
+    def set_thinking(self, live: bool, text: str = "") -> None:
+        self.thinking_line.display = True
+        self.thinking_line.set_class(live, "live")
+        if text:
+            self.thinking_line.update(text)
+
+
+class StreamingMessage(MessageView):
+    """A message that accumulates deltas while the agent is replying."""
+
+    FLUSH_INTERVAL = 0.08
+
+    def __init__(self, who: str, model: str | None = None) -> None:
+        super().__init__(who, model=model, classes="streaming")
+        self._parts: list[str] = []
+        self._flush_scheduled = False
+
+    def write_event(self, event: Event) -> None:
+        if event["type"] == "content":
+            self._parts.append(event["text"])
+            self._schedule_flush()
+        elif event["type"] == "thinking":
+            self.set_thinking(live=True)
+
+    def _schedule_flush(self) -> None:
+        if self._flush_scheduled:
+            return
+        self._flush_scheduled = True
+        self.set_timer(self.FLUSH_INTERVAL, self._flush)
+
+    def _flush(self) -> None:
+        self._flush_scheduled = False
+        self.set_body("".join(self._parts))
+        self._scroll_feed()
+
+    def finalize(self, content: str, thinking: str) -> None:
+        self.remove_class("streaming")
+        if thinking:
+            self.set_thinking(live=False, text="✻ thought for a bit")
+        self.set_body(content)
+        self._scroll_feed()
+
+    def mark_error(self, text: str) -> None:
+        self.remove_class("streaming")
+        self.add_class("errored")
+        self.set_body(f"**error:** {text}")
+        self._scroll_feed()
+
+    def mark_stopped(self) -> None:
+        self.remove_class("streaming")
+        self.who.update(f"{self.who.renderable}  · stopped")
+
+    def _scroll_feed(self) -> None:
+        parent = self.parent
+        if parent is not None:
+            parent.scroll_end(animate=False)
