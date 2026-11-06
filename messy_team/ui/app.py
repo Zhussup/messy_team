@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass
 
 from textual import on
@@ -11,11 +12,15 @@ from textual.containers import Horizontal, ScrollableContainer, Vertical
 from textual.message import Message
 from textual.widgets import Footer, Header, ListItem, ListView, Static, TextArea
 
-from ..agent import LEAD_DEFAULT_PROMPT, run_chat_turn
+from ..agent import (
+    LEAD_DEFAULT_PROMPT,
+    WORKER_DEFAULT_PROMPT,
+    run_chat_turn,
+)
 from ..config import Config
 from ..db import Database
 from ..ollama import ApiError, OllamaClient
-from .modals import SessionModal
+from .modals import AgentManagerModal, GroupModal, SessionModal
 from .widgets import MessageView, StreamingMessage
 
 
@@ -66,6 +71,7 @@ class MessyTeamApp(App[None]):
 
     BINDINGS = [
         Binding("ctrl+s", "sessions", "Sessions"),
+        Binding("ctrl+n", "agents", "Agents"),
         Binding("ctrl+q", "quit", "Quit", priority=True),
         Binding("ctrl+l", "feed_to_bottom", "Scroll to bottom"),
     ]
@@ -216,6 +222,70 @@ class MessyTeamApp(App[None]):
         view.set_body(message["content"])
         return view
 
+    # -- agents ------------------------------------------------------------
+
+    def action_agents(self) -> None:
+        if self.session_id is None:
+            self.notify("Open a session first (Ctrl+S)", severity="warning")
+            return
+        self.push_screen(
+            AgentManagerModal(self.db.list_agents(self.session_id),
+                              on_change=self._on_agent_edit)
+        )
+
+    def _on_agent_edit(self, result) -> None:
+        import sqlite3 as _sqlite3
+
+        if not result:
+            return
+        kind = result[0]
+        if kind == "create":
+            _, name, model, prompt = result
+            try:
+                agent_id = self.db.create_agent(
+                    self.session_id, name, model, prompt or
+                    WORKER_DEFAULT_PROMPT.format(name=name)
+                )
+            except _sqlite3.IntegrityError:
+                self.notify(f"Agent named {name!r} already exists", severity="error")
+                return
+            self.db.get_or_create_dm(self.session_id, agent_id, name)
+            self.notify(f"Agent {name} created — DM added to the sidebar")
+        elif kind == "update":
+            _, agent_id, name, model, prompt = result
+            self.db.update_agent(agent_id, name, model,
+                                 prompt or WORKER_DEFAULT_PROMPT.format(name=name))
+        elif kind == "delete":
+            self.db.delete_agent(result[1])
+            self._refresh_chats()
+            current = self.db.get_chat(self.chat_id) if self.chat_id else None
+            if current is None:
+                chats = self.db.list_chats(self.session_id)
+                if chats:
+                    self._open_chat(chats[0]["id"])
+                else:
+                    self.chat_id = None
+                    self._clear_feed()
+            self.notify("Agent deleted")
+        self._refresh_chats()
+
+    # -- group chats -------------------------------------------------------
+
+    def _new_group(self) -> None:
+        agents = self.db.list_agents(self.session_id)
+        if not agents:
+            self.notify("Create an agent first (Ctrl+N)", severity="warning")
+            return
+        self.push_screen(GroupModal(agents), self._on_group_result)
+
+    def _on_group_result(self, result) -> None:
+        if not result:
+            return
+        _, title, agent_ids = result
+        chat_id = self.db.create_group_chat(self.session_id, title, agent_ids)
+        self._refresh_chats()
+        self._open_chat(chat_id)
+
     # -- sending -----------------------------------------------------------
 
     @on(Composer.Submitted)
@@ -226,27 +296,62 @@ class MessyTeamApp(App[None]):
         if self.chat_id is None:
             self.notify("Open a session first (Ctrl+S)", severity="warning")
             return
+        if self._handle_slash(text):
+            return
         self.db.append_message(self.chat_id, "user", None, text)
         feed = self._feed()
         view = MessageView("You", classes="me")
         view.set_body(text)
         feed.mount(view)
         feed.scroll_end(animate=False)
-        self._start_agent_turn()
+        self._respond()
 
-    def _start_agent_turn(self) -> None:
+    def _handle_slash(self, text: str) -> bool:
+        """Run a command like /agents, /group, /sessions. Returns True if handled."""
+        if not text.startswith("/"):
+            return False
+        command = text[1:].strip()
+        if command == "agents":
+            self.action_agents()
+        elif command == "group":
+            self._new_group()
+        elif command == "sessions":
+            self.action_sessions()
+        else:
+            self._render_notice(
+                f"Unknown command /{command} — try /agents, /group, /sessions"
+            )
+        return True
+
+    def _route_responders(self, chat, user_text: str) -> list:
+        """Pick who answers: DM → its agent; group → @mentions, else the manager."""
+        if chat["kind"] == "dm":
+            agent = self.db.chat_agent(chat["id"])
+            return [agent] if agent is not None else []
+        members = self.db.agents_in_chat(chat["id"])
+        if not members:
+            return []
+        by_name = {a["name"].lower(): a for a in members}
+        responders: list = []
+        for handle in re.findall(r"@([A-Za-z0-9_-]+)", user_text):
+            agent = by_name.get(handle.lower())
+            if agent is not None and agent not in responders:
+                responders.append(agent)
+        if responders:
+            return responders
+        manager = next((a for a in members if a["kind"] == "manager"), None)
+        return [manager or members[0]]
+
+    def _respond(self) -> None:
         chat = self.db.get_chat(self.chat_id)
-        agent = self.db.chat_agent(chat["id"])
-        if agent is None:
-            self._render_notice("No agent in this chat yet — coming in M2")
+        user_text = self.db.list_messages(self.chat_id)[-1]["content"]
+        responders = self._route_responders(chat, user_text)
+        if not responders:
+            self._render_notice("Nobody to answer here — mention @name in a group")
             return
-        history = self._turn_history(self.chat_id)
-        stream = StreamingMessage(agent["name"], model=agent["model"])
-        self._feed().mount(stream)
-        self._feed().scroll_end(animate=False)
-        self._open_stream = stream
+        chat_id = chat["id"]
         self.run_worker(
-            self._turn_worker(agent, history, stream),
+            self._respond_worker(chat_id, responders),
             group="turn",
             exclusive=True,
             name="turn",
@@ -261,29 +366,40 @@ class MessyTeamApp(App[None]):
             history.append({"role": role, "content": message["content"]})
         return history
 
-    async def _turn_worker(self, agent, history, stream: StreamingMessage) -> None:
+    async def _respond_worker(self, chat_id: int, responders: list) -> None:
         try:
             client = self._require_client()
         except ApiError as error:
             self._render_notice(str(error))
-            self._open_stream = None
             return
-        try:
-            final = await run_chat_turn(
-                client, agent["model"], agent["system_prompt"], history,
-                stream.write_event,
-            )
-        except ApiError as error:
-            stream.mark_error(str(error))
-        except Exception as error:  # surface any bug, don't kill the app
-            stream.mark_error(f"unexpected: {error!r}")
-        else:
+        for agent in responders:
+            if agent is None:
+                continue
+            stream = StreamingMessage(agent["name"], model=agent["model"])
+            feed = self._feed()
+            feed.mount(stream)
+            feed.scroll_end(animate=False)
+            self._open_stream = stream
+            history = self._turn_history(chat_id)
+            try:
+                final = await run_chat_turn(
+                    client, agent["model"], agent["system_prompt"], history,
+                    stream.write_event,
+                )
+            except ApiError as error:
+                stream.mark_error(str(error))
+                self._open_stream = None
+                break  # stop the chain, e.g. on rate limits
+            except Exception as error:  # surface bugs without killing the app
+                stream.mark_error(f"unexpected: {error!r}")
+                self._open_stream = None
+                continue
             stream.finalize(final["content"], final["thinking"])
             self.db.append_message(
-                self.chat_id, "agent", agent["id"], final["content"],
+                chat_id, "agent", agent["id"], final["content"],
                 thinking=final["thinking"],
             )
-        self._open_stream = None
+            self._open_stream = None
 
     def _abort_stream(self) -> None:
         if self._open_stream is not None:

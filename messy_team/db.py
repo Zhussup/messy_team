@@ -140,6 +140,46 @@ class Database:
                 "SELECT * FROM agents WHERE id=?", (agent_id,)
             ).fetchone()
 
+    def update_agent(
+        self, agent_id: int, name: str, model: str, system_prompt: str
+    ) -> None:
+        with self._lock:
+            self._conn.execute(
+                "UPDATE agents SET name=?, model=?, system_prompt=? WHERE id=?",
+                (name, model, system_prompt, agent_id),
+            )
+            self._conn.commit()
+
+    def delete_agent(self, agent_id: int) -> None:
+        """Remove the agent, its DM chats and its memberships."""
+        with self._lock:
+            self._conn.execute(
+                "DELETE FROM chats WHERE session_id IN (SELECT session_id FROM agents"
+                " WHERE id=?) AND dm_agent_id=?",
+                (agent_id, agent_id),
+            )
+            self._conn.execute(
+                "DELETE FROM chat_members WHERE agent_id=?", (agent_id,)
+            )
+            self._conn.execute("DELETE FROM agents WHERE id=?", (agent_id,))
+            self._conn.commit()
+
+    def session_manager(self, session_id: int) -> sqlite3.Row | None:
+        with self._lock:
+            return self._conn.execute(
+                "SELECT * FROM agents WHERE session_id=? AND kind='manager'"
+                " ORDER BY id LIMIT 1",
+                (session_id,),
+            ).fetchone()
+
+    def agents_in_chat(self, chat_id: int) -> list[sqlite3.Row]:
+        with self._lock:
+            return self._conn.execute(
+                "SELECT a.* FROM chat_members m JOIN agents a ON a.id=m.agent_id"
+                " WHERE m.chat_id=? ORDER BY a.id",
+                (chat_id,),
+            ).fetchall()
+
     # chats ----------------------------------------------------------------
 
     def create_chat(
@@ -167,6 +207,20 @@ class Database:
             if row:
                 return int(row["id"])
         return self.create_chat(session_id, "dm", title, dm_agent_id=agent_id)
+
+    def create_group_chat(self, session_id: int, title: str, agent_ids: list[int]) -> int:
+        with self._lock:
+            cur = self._conn.execute(
+                "INSERT INTO chats(session_id, kind, title) VALUES(?, 'group', ?)",
+                (session_id, title),
+            )
+            chat_id = int(cur.lastrowid)
+            self._conn.executemany(
+                "INSERT OR IGNORE INTO chat_members(chat_id, agent_id) VALUES(?,?)",
+                [(chat_id, agent_id) for agent_id in agent_ids],
+            )
+            self._conn.commit()
+            return chat_id
 
     def list_chats(self, session_id: int) -> list[sqlite3.Row]:
         with self._lock:
