@@ -6,6 +6,7 @@ import json
 from typing import Any, Awaitable, Callable
 
 from .ollama import OllamaClient
+from .tools import TOOLS_SPEC
 
 LEAD_DEFAULT_PROMPT = (
     "You are {name}, the coordinator of a small team of coding agents living in"
@@ -25,6 +26,39 @@ TOOL_INSTRUCTIONS = (
     " verify results with commands. Paths are workspace-relative. Keep chat"
     " replies short; use tools for anything involving files or commands."
 )
+
+TEAM_INSTRUCTIONS = (
+    " You have teammates living in this app: {teammates}. To contact one, call"
+    " send_message(to_agent, text, private): a public message appears in the"
+    " group chat you are in; a private message opens in the teammate's direct"
+    " chat. Use it for real handoffs, not small talk; one call per message."
+)
+
+CHAT_TOOLS_SPEC = [
+    {
+        "type": "function",
+        "function": {
+            "name": "send_message",
+            "description": (
+                "Send a message to a teammate agent. public=false + group chat"
+                " shows it in the group and they answer there; private=true"
+                " sends it to their direct chat."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "to_agent": {"type": "string",
+                                 "description": "Exact teammate name"},
+                    "text": {"type": "string"},
+                    "private": {"type": "boolean"},
+                },
+                "required": ["to_agent", "text", "private"],
+            },
+        },
+    }
+]
+
+AGENT_TOOLS_SPEC = TOOLS_SPEC + CHAT_TOOLS_SPEC
 
 Event = dict[str, Any]
 

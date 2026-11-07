@@ -15,7 +15,9 @@ from textual.message import Message
 from textual.widgets import Footer, Header, ListItem, ListView, Static, TextArea
 
 from ..agent import (
+    AGENT_TOOLS_SPEC,
     LEAD_DEFAULT_PROMPT,
+    TEAM_INSTRUCTIONS,
     TOOL_INSTRUCTIONS,
     WORKER_DEFAULT_PROMPT,
     run_agent_turn,
@@ -24,7 +26,7 @@ from ..config import Config
 from ..db import Database
 from ..ollama import ApiError, OllamaClient
 from ..permissions import ASK, ALLOW, DENY, Permissions
-from ..tools import TOOLS_SPEC, ToolError, ToolExecutor
+from ..tools import ToolError, ToolExecutor
 from .modals import AgentManagerModal, GroupModal, PermissionModal, SessionModal
 from .widgets import MessageView, StreamingMessage, ToolCard
 
@@ -214,6 +216,8 @@ class MessyTeamApp(App[None]):
             feed.mount(view)
             if message["is_tool_round"]:
                 for call in self.db.list_tool_calls(message["id"]):
+                    if call["name"] == "send_message":
+                        continue  # visible as the message itself
                     feed.mount(ToolCard.from_record(call))
         feed.scroll_end(animate=False)
 
@@ -398,6 +402,13 @@ class MessyTeamApp(App[None]):
         for message in self.db.list_messages(chat_id):
             if message["is_tool_round"] or not message["content"]:
                 continue
+            if message["delivered"]:
+                history.append({
+                    "role": "user",
+                    "content": (f"message from {message['agent_name']}:"
+                                f" {message['content']}"),
+                })
+                continue
             role = "user" if message["author"] == "user" else "assistant"
             history.append({"role": role, "content": message["content"]})
         return history
@@ -415,15 +426,82 @@ class MessyTeamApp(App[None]):
         except ToolError as error:
             self._render_notice(f"Workspace problem: {error}")
             return
+        # One relay per user turn: initial responders plus queued agent→agent
+        # messages, capped to keep chains from running away.
+        relay = {"queue": asyncio.Queue(), "hops_left": 8, "turns_left": 12}
         for agent in responders:
-            if agent is None:
-                continue
+            if agent is None or not self._claim_turn(relay):
+                if agent is None:
+                    continue
+                break
             await self._agent_respond(
-                client, chat_id, agent, executor, chat["perm_mode"]
+                client, chat_id, agent, executor, chat["perm_mode"], relay
+            )
+        while not relay["queue"].empty():
+            if relay["hops_left"] <= 0 or relay["turns_left"] <= 0:
+                break
+            delivery = relay["queue"].get_nowait()
+            relay["hops_left"] -= 1
+            target = self.db.get_chat(delivery["chat_id"])
+            if not self._claim_turn(relay):
+                break
+            await self._agent_respond(
+                client, delivery["chat_id"], delivery["recipient"], executor,
+                target["perm_mode"], relay,
+            )
+        if not relay["queue"].empty():
+            self._render_notice(
+                "Agent-to-agent relay budget exhausted — remaining messages"
+                " are dropped"
             )
 
+    @staticmethod
+    def _claim_turn(relay: dict) -> bool:
+        if relay["turns_left"] <= 0:
+            return False
+        relay["turns_left"] -= 1
+        return True
+
+    def _handle_send_message(self, sender, chat_id: int, arguments: dict,
+                             relay: dict) -> str:
+        to_name = str(arguments.get("to_agent", "")).strip()
+        text = str(arguments.get("text", "")).strip()
+        private = bool(arguments.get("private"))
+        if not to_name or not text:
+            return "ERROR: to_agent and text are required"
+        if relay["hops_left"] <= 0:
+            return "ERROR: agent-to-agent message budget exhausted"
+        recipient = self.db.agent_by_name(self.session_id, to_name)
+        if recipient is None:
+            names = ", ".join(a["name"] for a in self.db.list_agents(self.session_id))
+            return f"ERROR: no teammate named {to_name!r}; teammates: {names}"
+        if recipient["id"] == sender["id"]:
+            return "ERROR: pick a teammate, not yourself"
+        current = self.db.get_chat(chat_id)
+        if not private and current and current["kind"] == "group":
+            target_id = chat_id
+            place = f"group {current['title']}"
+        else:
+            target_id = self.db.get_or_create_dm(
+                self.session_id, recipient["id"], recipient["name"]
+            )
+            place = f"private chat with {recipient['name']}"
+        self.db.append_message(target_id, "agent", sender["id"], text, delivered=1)
+        if self.chat_id == target_id:
+            feed = self._feed()
+            view = MessageView(sender["name"], model=sender["model"],
+                               classes="agent")
+            view.set_body(text)
+            feed.mount(view)
+            feed.scroll_end(animate=False)
+        relay["queue"].put_nowait(
+            {"chat_id": target_id, "recipient": recipient}
+        )
+        return f"delivered to {recipient['name']} in {place}"
+
     async def _agent_respond(self, client: OllamaClient, chat_id: int, agent,
-                             executor: ToolExecutor, perm_mode: str) -> None:
+                             executor: ToolExecutor, perm_mode: str,
+                             relay: dict) -> None:
         """One full responding turn for one agent, with tool rounds."""
         state: dict = {"stream": None, "msg_id": None}
 
@@ -461,6 +539,14 @@ class MessyTeamApp(App[None]):
                 )
             message_id = state["msg_id"]
 
+            if name == "send_message":
+                result = self._handle_send_message(agent, chat_id, arguments, relay)
+                self.db.insert_tool_call(
+                    message_id, name, json.dumps(arguments, ensure_ascii=False),
+                    "done", result,
+                )
+                return result
+
             decision = self.permissions.decide(chat_id, perm_mode, name)
             if decision == ASK:
                 choice = await self._await_approval(agent["name"], name, arguments)
@@ -489,15 +575,22 @@ class MessyTeamApp(App[None]):
             )
             return result
 
-        system_prompt = agent["system_prompt"] + "\n\n" + TOOL_INSTRUCTIONS.format(
-            workspace=self.db.get_session(self.session_id)["cwd"]
+        workspace = self.db.get_session(self.session_id)["cwd"]
+        teammates = ", ".join(
+            a["name"] for a in self.db.list_agents(self.session_id)
+            if a["id"] != agent["id"]
+        ) or "none yet"
+        system_prompt = (
+            agent["system_prompt"] + "\n\n"
+            + TOOL_INSTRUCTIONS.format(workspace=workspace)
+            + TEAM_INSTRUCTIONS.format(teammates=teammates)
         )
         try:
             final = await run_agent_turn(
                 client, agent["model"], system_prompt,
-                self._turn_history(chat_id), TOOLS_SPEC if agent["tools_enabled"]
-                else None,
-                write_event, on_tool_call,
+                self._turn_history(chat_id),
+                AGENT_TOOLS_SPEC if agent["tools_enabled"] else None,
+                write_event, on_tool_call, max_rounds=15,
             )
         except ApiError as error:
             ensure_stream().mark_error(str(error))

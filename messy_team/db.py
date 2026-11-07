@@ -52,6 +52,7 @@ CREATE TABLE IF NOT EXISTS messages(
   thinking TEXT NOT NULL DEFAULT '',
   tool_calls TEXT,
   is_tool_round INTEGER NOT NULL DEFAULT 0,
+  delivered INTEGER NOT NULL DEFAULT 0,
   reply_to INTEGER,
   created_at TEXT NOT NULL DEFAULT (datetime('now'))
 );
@@ -89,12 +90,12 @@ class Database:
     def _migrate(self) -> None:
         with self._lock:
             version = self._conn.execute("PRAGMA user_version").fetchone()[0]
+            columns = lambda table: {  # noqa: E731
+                row[1] for row in self._conn.execute(
+                    f"PRAGMA table_info({table})"
+                )
+            }
             if version < 1:
-                columns = lambda table: {  # noqa: E731
-                    row[1] for row in self._conn.execute(
-                        f"PRAGMA table_info({table})"
-                    )
-                }
                 if "is_tool_round" not in columns("messages"):
                     self._conn.execute(
                         "ALTER TABLE messages"
@@ -105,8 +106,14 @@ class Database:
                         "ALTER TABLE agents"
                         " ADD COLUMN tools_enabled INTEGER NOT NULL DEFAULT 1"
                     )
-                self._conn.execute("PRAGMA user_version = 1")
-                self._conn.commit()
+            if version < 2:
+                if "delivered" not in columns("messages"):
+                    self._conn.execute(
+                        "ALTER TABLE messages"
+                        " ADD COLUMN delivered INTEGER NOT NULL DEFAULT 0"
+                    )
+            self._conn.execute("PRAGMA user_version = 2")
+            self._conn.commit()
 
     def close(self) -> None:
         with self._lock:
@@ -195,6 +202,14 @@ class Database:
                 "SELECT * FROM agents WHERE session_id=? AND kind='manager'"
                 " ORDER BY id LIMIT 1",
                 (session_id,),
+            ).fetchone()
+
+    def agent_by_name(self, session_id: int, name: str) -> sqlite3.Row | None:
+        with self._lock:
+            return self._conn.execute(
+                "SELECT * FROM agents WHERE session_id=? AND lower(name)=lower(?)"
+                " LIMIT 1",
+                (session_id, name),
             ).fetchone()
 
     def agents_in_chat(self, chat_id: int) -> list[sqlite3.Row]:
@@ -305,13 +320,15 @@ class Database:
         thinking: str = "",
         tool_calls: str | None = None,
         is_tool_round: int = 0,
+        delivered: int = 0,
     ) -> int:
         with self._lock:
             cur = self._conn.execute(
                 "INSERT INTO messages(chat_id, author, agent_id, content, thinking,"
-                " tool_calls, is_tool_round) VALUES(?,?,?,?,?,?,?)",
+                " tool_calls, is_tool_round, delivered)"
+                " VALUES(?,?,?,?,?,?,?,?)",
                 (chat_id, author, agent_id, content, thinking, tool_calls,
-                 is_tool_round),
+                 is_tool_round, delivered),
             )
             self._conn.commit()
             return int(cur.lastrowid)
