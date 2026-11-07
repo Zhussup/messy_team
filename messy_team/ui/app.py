@@ -16,7 +16,10 @@ from textual.widgets import Footer, Header, ListItem, ListView, Static, TextArea
 
 from ..agent import (
     AGENT_TOOLS_SPEC,
+    CHAT_TOOLS_SPEC,
     LEAD_DEFAULT_PROMPT,
+    MANAGER_INSTRUCTIONS,
+    MANAGER_TOOLS_SPEC,
     TEAM_INSTRUCTIONS,
     TOOL_INSTRUCTIONS,
     WORKER_DEFAULT_PROMPT,
@@ -428,7 +431,7 @@ class MessyTeamApp(App[None]):
             return
         # One relay per user turn: initial responders plus queued agent→agent
         # messages, capped to keep chains from running away.
-        relay = {"queue": asyncio.Queue(), "hops_left": 8, "turns_left": 12}
+        relay = {"queue": asyncio.Queue(), "hops_left": 12, "turns_left": 20}
         for agent in responders:
             if agent is None or not self._claim_turn(relay):
                 if agent is None:
@@ -462,6 +465,95 @@ class MessyTeamApp(App[None]):
         relay["turns_left"] -= 1
         return True
 
+    def _handle_manager_tool(self, sender, tool: str, arguments: dict,
+                             relay: dict) -> str:
+        if tool == "create_agent":
+            return self._spawn_agent(arguments)
+        if tool == "create_group":
+            return self._spawn_group(sender, arguments)
+        if tool == "assign_task":
+            return self._assign_task(sender, arguments, relay)
+        return f"ERROR: unknown manager tool {tool}"
+
+    def _spawn_agent(self, arguments: dict) -> str:
+        raw = str(arguments.get("name") or "")
+        name = re.sub(r"[^A-Za-z0-9_-]", "", raw).strip("-_")[:24]
+        if not name:
+            return "ERROR: a name of letters, digits, _ or - is required"
+        renamed = ""
+        if self.db.agent_by_name(self.session_id, name):
+            base, suffix = name, 2
+            while self.db.agent_by_name(self.session_id, f"{base}{suffix}"):
+                suffix += 1
+            name = f"{base}{suffix}"
+            renamed = " (name taken, renamed)"
+        model = str(arguments.get("model") or "").strip() \
+            or self.config.worker_model
+        prompt = WORKER_DEFAULT_PROMPT.format(name=name)
+        instructions = str(arguments.get("instructions") or "").strip()
+        if instructions:
+            prompt += "\n\n" + instructions
+        agent_id = self.db.create_agent(self.session_id, name, model, prompt)
+        self.db.get_or_create_dm(self.session_id, agent_id, name)
+        self._refresh_chats()
+        return f"created agent {name} (model {model}) with a DM chat{renamed}"
+
+    def _spawn_group(self, sender, arguments: dict) -> str:
+        title = str(arguments.get("title") or "").strip()
+        raw = arguments.get("agents")
+        if isinstance(raw, str):
+            try:
+                raw = json.loads(raw)
+            except json.JSONDecodeError:
+                raw = [p.strip() for p in raw.split(",") if p.strip()]
+        member_ids: list[int] = [sender["id"]]
+        missing: list[str] = []
+        seen = set()
+        for item in raw if isinstance(raw, list) else []:
+            row = self.db.agent_by_name(self.session_id, str(item).strip())
+            if row is None:
+                missing.append(str(item))
+            elif row["id"] not in seen and row["id"] != sender["id"]:
+                seen.add(row["id"])
+                member_ids.append(row["id"])
+        if not title or len(member_ids) < 2:
+            return (f"ERROR: title plus at least one valid teammate required;"
+                    f" unknown names: {missing}")
+        chat_id = self.db.create_group_chat(self.session_id, title, member_ids)
+        self._refresh_chats()
+        return f"created group {title!r} with {len(member_ids)} member(s)"
+
+    def _assign_task(self, sender, arguments: dict, relay: dict) -> str:
+        to_name = str(arguments.get("to_agent") or "").strip()
+        task = str(arguments.get("task") or "").strip()
+        if not to_name or not task:
+            return "ERROR: to_agent and task are required"
+        if relay["hops_left"] <= 0:
+            return "ERROR: agent-to-agent message budget exhausted"
+        recipient = self.db.agent_by_name(self.session_id, to_name)
+        if recipient is None:
+            names = ", ".join(a["name"] for a in self.db.list_agents(self.session_id))
+            return f"ERROR: no teammate named {to_name!r}; teammates: {names}"
+        if recipient["id"] == sender["id"]:
+            return "ERROR: assign tasks to a teammate, not yourself"
+        chat_id = self.db.get_or_create_dm(
+            self.session_id, recipient["id"], recipient["name"]
+        )
+        text = f"[task from {sender['name']}] {task}"
+        self.db.append_message(chat_id, "agent", sender["id"], text, delivered=1)
+        self._render_delivered_view(chat_id, sender, text)
+        relay["queue"].put_nowait({"chat_id": chat_id, "recipient": recipient})
+        return f"assigned a task to {recipient['name']} in their direct chat"
+
+    def _render_delivered_view(self, chat_id: int, sender, text: str) -> None:
+        if self.chat_id != chat_id:
+            return
+        feed = self._feed()
+        view = MessageView(sender["name"], model=sender["model"], classes="agent")
+        view.set_body(text)
+        feed.mount(view)
+        feed.scroll_end(animate=False)
+
     def _handle_send_message(self, sender, chat_id: int, arguments: dict,
                              relay: dict) -> str:
         to_name = str(arguments.get("to_agent", "")).strip()
@@ -487,13 +579,7 @@ class MessyTeamApp(App[None]):
             )
             place = f"private chat with {recipient['name']}"
         self.db.append_message(target_id, "agent", sender["id"], text, delivered=1)
-        if self.chat_id == target_id:
-            feed = self._feed()
-            view = MessageView(sender["name"], model=sender["model"],
-                               classes="agent")
-            view.set_body(text)
-            feed.mount(view)
-            feed.scroll_end(animate=False)
+        self._render_delivered_view(target_id, sender, text)
         relay["queue"].put_nowait(
             {"chat_id": target_id, "recipient": recipient}
         )
@@ -539,6 +625,16 @@ class MessyTeamApp(App[None]):
                 )
             message_id = state["msg_id"]
 
+            if agent["kind"] == "manager" and name in (
+                "create_agent", "create_group", "assign_task"
+            ):
+                result = self._handle_manager_tool(agent, name, arguments, relay)
+                self.db.insert_tool_call(
+                    message_id, name, json.dumps(arguments, ensure_ascii=False),
+                    "done", result,
+                )
+                return result
+
             if name == "send_message":
                 result = self._handle_send_message(agent, chat_id, arguments, relay)
                 self.db.insert_tool_call(
@@ -576,20 +672,30 @@ class MessyTeamApp(App[None]):
             return result
 
         workspace = self.db.get_session(self.session_id)["cwd"]
-        teammates = ", ".join(
-            a["name"] for a in self.db.list_agents(self.session_id)
+        others = [
+            a for a in self.db.list_agents(self.session_id)
             if a["id"] != agent["id"]
-        ) or "none yet"
+        ]
+        teammates = ", ".join(a["name"] for a in others) or "none yet"
         system_prompt = (
             agent["system_prompt"] + "\n\n"
             + TOOL_INSTRUCTIONS.format(workspace=workspace)
             + TEAM_INSTRUCTIONS.format(teammates=teammates)
         )
+        tools_spec = AGENT_TOOLS_SPEC
+        if agent["kind"] == "manager":
+            system_prompt += MANAGER_INSTRUCTIONS
+            if others:
+                # A manager with a team coordinates only: no file tools, so it
+                # cannot drift into doing or double-checking teammates' work.
+                tools_spec = CHAT_TOOLS_SPEC + MANAGER_TOOLS_SPEC
+            else:
+                tools_spec = AGENT_TOOLS_SPEC + MANAGER_TOOLS_SPEC
         try:
             final = await run_agent_turn(
                 client, agent["model"], system_prompt,
                 self._turn_history(chat_id),
-                AGENT_TOOLS_SPEC if agent["tools_enabled"] else None,
+                tools_spec if agent["tools_enabled"] else None,
                 write_event, on_tool_call, max_rounds=15,
             )
         except ApiError as error:

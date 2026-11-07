@@ -11,8 +11,10 @@ from .tools import TOOLS_SPEC
 LEAD_DEFAULT_PROMPT = (
     "You are {name}, the coordinator of a small team of coding agents living in"
     " Messy Team, a messenger-style terminal app. Keep replies short and useful."
-    " You can create teammates and delegate tasks (being built). Never invent"
-    " capabilities you do not have."
+    " You can create teammates with create_agent and hand them tasks with"
+    " assign_task. After organizing, tell the user briefly what you set up and"
+    " end your turn - teammates work and report back automatically; their"
+    " messages arrive in your chats. Never invent capabilities you do not have."
 )
 
 WORKER_DEFAULT_PROMPT = (
@@ -33,6 +35,74 @@ TEAM_INSTRUCTIONS = (
     " group chat you are in; a private message opens in the teammate's direct"
     " chat. Use it for real handoffs, not small talk; one call per message."
 )
+
+MANAGER_INSTRUCTIONS = (
+    " As the team manager you have three people tools. create_agent spawns a"
+    " new teammate (default model unless `model` is given; `instructions`"
+    " become part of their prompt). create_group(title, agents) opens a group"
+    " chat. assign_task(to_agent, task) writes the task into a teammate's"
+    " direct chat and they start working. When the user asks you to organize"
+    " or autonomously execute something: create the teammates you need, assign"
+    " concrete tasks with assign_task, and end your turn with a short status"
+    " note. Do not run bash or file tools to check on teammates and never do"
+    " their file work yourself - teammate reports arrive automatically as new"
+    " messages, and only then you reply to the user."
+)
+
+AGENT_TOOL_SCHEMA = {
+    "type": "function",
+    "function": {
+        "name": "create_agent",
+        "description": "Spawn a new teammate agent with a DM chat.",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "name": {"type": "string", "description": "Teammate name"},
+                "model": {"type": "string",
+                          "description": "Model name, optional"},
+                "instructions": {"type": "string",
+                                 "description": "Extra prompt for them, optional"},
+            },
+            "required": ["name"],
+        },
+    },
+}
+
+GROUP_TOOL_SCHEMA = {
+    "type": "function",
+    "function": {
+        "name": "create_group",
+        "description": "Open a group chat with the named teammates (and you).",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "title": {"type": "string"},
+                "agents": {"type": "array", "items": {"type": "string"},
+                           "description": "Teammate names"},
+            },
+            "required": ["title", "agents"],
+        },
+    },
+}
+
+TASK_TOOL_SCHEMA = {
+    "type": "function",
+    "function": {
+        "name": "assign_task",
+        "description": "Give a teammate a concrete task in their direct chat.",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "to_agent": {"type": "string"},
+                "task": {"type": "string",
+                         "description": "Precise task description"},
+            },
+            "required": ["to_agent", "task"],
+        },
+    },
+}
+
+MANAGER_TOOLS_SPEC = [AGENT_TOOL_SCHEMA, GROUP_TOOL_SCHEMA, TASK_TOOL_SCHEMA]
 
 CHAT_TOOLS_SPEC = [
     {
