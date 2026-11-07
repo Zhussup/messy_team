@@ -50,16 +50,31 @@ hand out tasks on its own — like opencode, but as a team chat.
 ## Quick start
 
 ```bash
-git clone https://github.com/Zhussup/messy-team
-cd messy-team
-python3 -m venv .venv && . .venv/bin/activate
-pip install .
+git clone https://github.com/Zhussup/messy_team.git
+cd messy_team
 
-# an Ollama Cloud key: https://ollama.com/settings/keys
+# an Ollama Cloud key (create at https://ollama.com/settings/keys)
 export OLLAMA_API_KEY="..."
 
-messy_team            # or: python -m messy_team
+./run.sh
 ```
+
+That is the whole launch. `run.sh` creates a `.venv` on first run, installs
+the dependencies into it and starts the TUI — no activation needed.
+
+The manual equivalent, if you prefer not to use the script:
+
+```bash
+python3 -m venv .venv
+.venv/bin/pip install .
+.venv/bin/messy_team
+```
+
+Note: outside the `.venv` there is no `messy_team` command and system
+`pip` is locked down by Debian (`externally-managed`), so always use
+`.venv/bin/...` — or run `./run.sh` and let it handle that. After a
+`git pull`, `./run.sh` reinstalls automatically when `pyproject.toml`
+changed.
 
 ## Key bindings and commands
 
@@ -98,12 +113,13 @@ Pilot tests drive the real Textual app headless against the live API
 (they spend credits and take several minutes each):
 
 ```bash
-python tests/pilot_smoke.py     # session, streaming reply, restart
-python tests/pilot_agents.py    # agents, DMs, groups, @routing
-python tests/pilot_tools.py     # tool loop, permissions, tool cards
-python tests/pilot_relay.py     # agent-to-agent relay chains
-python tests/pilot_manager.py   # autonomous manager: spawn + delegate
-python tests/pilot_polish.py    # /model picker, /balance
+.venv/bin/python tests/pilot_smoke.py     # session, streaming reply, restart
+.venv/bin/python tests/pilot_agents.py    # agents, DMs, groups, @routing
+.venv/bin/python tests/pilot_tools.py     # tool loop, permissions, tool cards
+.venv/bin/python tests/pilot_relay.py     # agent-to-agent relay chains
+.venv/bin/python tests/pilot_manager.py   # autonomous manager: spawn + delegate
+.venv/bin/python tests/pilot_polish.py    # /model picker, /balance
+.venv/bin/python tests/pilot_crash.py kill   # then: ... check
 ```
 
 ## License
