@@ -90,10 +90,12 @@ async def main() -> None:
                     await pilot.pause(0.3)
                     continue
                 rows = conn.execute(
-                    "SELECT m.content, a.name FROM messages m JOIN agents a"
+                    "SELECT m.content FROM messages m JOIN agents a"
                     " ON a.id=m.agent_id JOIN chats c ON c.id=m.chat_id"
-                    " WHERE c.kind='dm' AND m.author='agent' AND m.delivered=0"
-                    " AND m.is_tool_round=0 AND instr(lower(m.content),'complet')>0"
+                    " WHERE c.kind='dm' AND a.name='Atlas' AND m.author='agent'"
+                    " AND m.delivered=0 AND m.is_tool_round=0"
+                    " AND (instr(lower(m.content),'complet')>0"
+                    "      OR instr(m.content,'relay.txt')>0)"
                 ).fetchall()
                 if rows:
                     finished = True

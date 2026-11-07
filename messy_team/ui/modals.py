@@ -15,6 +15,7 @@ from textual.widgets import (
     Input,
     ListItem,
     ListView,
+    OptionList,
     SelectionList,
     Static,
     TextArea,
@@ -129,17 +130,21 @@ class AgentModal(ModalScreen[AgentEditResult]):
     #agent-dialog TextArea { height: 6; margin-bottom: 1;
                              border: round $surface-lighten-2; }
     #agent-dialog .hint { color: $text-muted; margin-bottom: 1; }
+    #model-picker { height: auto; max-height: 8; margin-bottom: 1;
+                    border: round $surface-lighten-2; }
     #agent-dialog .btns { height: auto; align: right middle; }
     #agent-dialog Button { margin-left: 2; }
     """
 
     def __init__(
-        self, agent=None, suggestion: str | None = None, default_model: str = ""
+        self, agent=None, suggestion: str | None = None, default_model: str = "",
+        models: list[str] | None = None,
     ) -> None:
         super().__init__()
         self._agent = agent
         self._suggestion = suggestion
         self._default_model = default_model
+        self._models = list(models or [])
 
     def compose(self) -> ComposeResult:
         editing = self._agent is not None
@@ -151,6 +156,8 @@ class AgentModal(ModalScreen[AgentEditResult]):
             yield Input(id="inp-name", placeholder="Name", value=name)
             yield Input(id="inp-model", placeholder="Model (e.g. glm-5.3-flash)",
                         value=model)
+            if self._models:
+                yield from self._picker()
             yield TextArea(prompt, id="inp-prompt", soft_wrap=True)
             yield Static("Empty prompt keeps the default worker prompt",
                          classes="hint")
@@ -161,6 +168,29 @@ class AgentModal(ModalScreen[AgentEditResult]):
                     yield Button("Save", id="btn-save", variant="primary")
                 else:
                     yield Button("Create", id="btn-create", variant="primary")
+
+    def _picker(self) -> ComposeResult:
+        yield Static("Cloud models (Enter fills the field):", classes="hint")
+        yield OptionList(*self._models, id="model-picker")
+
+    def set_models(self, models: list[str]) -> None:
+        """Attach the picker after a late /api/tags fetch."""
+        if not models or self._models:
+            return
+        if not self.is_attached:
+            self._models = list(models)
+            return
+        self._models = list(models)
+        dialog = self.query_one("#agent-dialog")
+        dialog.mount(*self._picker())
+
+    def on_option_list_option_selected(
+        self, event: OptionList.OptionSelected
+    ) -> None:
+        prompt = str(event.control.get_option_at_index(event.option_index).prompt)
+        field = self.query_one("#inp-model", Input)
+        field.value = prompt
+        field.focus()
 
     def _fields(self) -> tuple[str, str, str]:
         name = self.query_one("#inp-name", Input).value.strip()
@@ -227,14 +257,16 @@ class AgentManagerModal(ModalScreen[bool]):
     def _push_agent_modal(self, agent=None) -> None:
         taken = [a["name"] for a in self._agents]
         suggestion = None if agent else (suggested_names.suggest(taken, 1) or [None])[0]
-        self.app.push_screen(
-            AgentModal(
-                agent=agent,
-                suggestion=suggestion,
-                default_model=self.app.config.worker_model,
-            ),
-            self._on_agent_modal_closed,
+        modal = AgentModal(
+            agent=agent,
+            suggestion=suggestion,
+            default_model=self.app.config.worker_model,
+            models=self.app.models_cache,
         )
+        self.app.push_screen(modal, self._on_agent_modal_closed)
+        if self.app.models_cache is None:
+            self.app.run_worker(self.app._refresh_models(self.app.screen),
+                                exclusive=True)
 
     def _on_agent_modal_closed(self, result: AgentEditResult) -> None:
         if result is None:

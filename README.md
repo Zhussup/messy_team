@@ -1,50 +1,111 @@
 # Messy Team
 
-A messenger-style terminal app where coding agents live in sessions, DMs and
-group chats — like opencode, but the whole thing looks like a chat client.
+A terminal messenger where your coding agents live.
 
-Built with [Textual](https://github.com/Textualize/textual), models served by
-[Ollama Cloud](https://ollama.com) (OpenAI-ecosystem cloud LLMs via the native
-Ollama API).
+Several sessions, each with its own workspace, roster of agents and chats.
+You talk to agents in direct messages and group chats; agents talk to each
+other; and the built-in **Lead** manager can spawn teammates, open groups and
+hand out tasks on its own — like opencode, but as a team chat.
 
-## Status
-
-Work in progress.
-
-- **M1 (current)** — app skeleton: sessions, DM chats with one agent, streaming
-  replies, SQLite persistence.
-- **M2+** — agent management, group chats, coding tools with permission
-  prompts, agent-to-agent messaging, a coordinator agent that spawns and
-  manages teammates, autonomous teams.
-
-## Install
-
-```bash
-python3 -m venv .venv
-.venv/bin/pip install -e .
-export OLLAMA_API_KEY=...   # create a key at https://ollama.com/settings/keys
-.venv/bin/messy_team
+```
+┌──────────────────────────────────────────────────────────┐
+│  Chats              │  @ Builder  ·  tools: ask          │
+│  ─────────────      │  ──────────────────────────────    │
+│  · Lead             │  You: create notes.txt with a haiku│
+│  · Builder          │  Builder thinks…                   │
+│  # review-crew      │  ▸ write_file  notes.txt  ✓        │
+│                     │  Builder: done — a haiku it is.    │
+│                     │  ┌────────────────────────────┐    │
+│                     │  │ > write here               │    │
+│                     │  └────────────────────────────┘    │
+└──────────────────────────────────────────────────────────┘
 ```
 
-Configuration lives in `~/.config/messy-team/config.toml` (optional):
+## How it works
+
+- **Sessions** — each is a workspace directory plus its own SQLite history.
+  Switch with `Ctrl+S`; everything (agents, chats, messages, tool calls)
+  persists across restarts.
+- **Agents** — LLM-backed coding agents (Ollama Cloud models) with file and
+  shell tools: `read_file`, `write_file`, `edit_file`, `ls`, `glob`, `grep`,
+  `bash`. Tool calls are shown as collapsible cards in the feed.
+- **Chats** — direct chats (`@name`) and group chats (`#title`). In a group,
+  `@mention` routes your message; without a mention the manager decides who
+  answers.
+- **Agent↔agent messaging** — agents call `send_message(to_agent, text,
+  private)`. Public messages appear in the group; private ones are delivered
+  to the teammate's direct chat, where you can read the whole exchange.
+- **The manager** — every session starts with **Lead**, which has three extra
+  tools: `create_agent`, `create_group`, `assign_task`. Ask it to organize
+  work autonomously: it spawns teammates, delegates concrete tasks, and
+  teammate reports arrive right back in its chat. A manager with a live team
+  only coordinates messages — file work belongs to workers. Agent-to-agent
+  chains run inside a per-turn budget, so they can't run away.
+- **Permissions** — file writes and shell commands ask before running
+  (Deny / Always in this chat / Once). Cycle the current chat's mode with
+  `Ctrl+P`: ask → allow → read-only. Reads are always free.
+- **Streaming** — replies and *thinking* stream into the feed; tool rounds,
+  errors and rate-limit retries are handled mid-flight.
+
+## Quick start
+
+```bash
+git clone https://github.com/Zhussup/messy-team
+cd messy-team
+python3 -m venv .venv && . .venv/bin/activate
+pip install .
+
+# an Ollama Cloud key: https://ollama.com/settings/keys
+export OLLAMA_API_KEY="..."
+
+messy_team            # or: python -m messy_team
+```
+
+## Key bindings and commands
+
+| Key / command | Action |
+|---|---|
+| `Ctrl+S` | open / create a session |
+| `Ctrl+N` | agent manager (create, edit, delete) |
+| `Ctrl+P` | cycle tool permission mode of the open chat |
+| `Ctrl+L` | scroll the feed to the bottom |
+| `/agents`, `/group` | agent manager, new group chat |
+| `/model` | edit the current chat's agent (with a model picker) |
+| `/balance` | remaining Ollama Cloud credits |
+| `/sessions` | session switcher |
+
+Enter sends, Shift+Enter breaks a line.
+
+## Configuration
+
+Optional `~/.config/messy-team/config.toml`:
 
 ```toml
 api_base = "https://ollama.com/api"
+api_key = "..."             # OLLAMA_API_KEY env var also works
 manager_model = "glm-5.3"
 worker_model = "glm-5.3-flash"
+db_path = "~/.local/share/messy-team/messy.db"
 ```
 
-`OLLAMA_API_KEY` from the environment wins over `api_key` in the config file.
+History lives in a single SQLite database (`WAL` mode) under
+`~/.local/share/messy-team/` by default. Override any location with
+`MESSY_TEAM_CONFIG`, `MESSY_TEAM_DATA_DIR` or `MESSY_TEAM_DB`.
 
-## Layout
+## Development
 
-- **Sidebar** — chats of the current session.
-- **Feed** — message history of the open chat.
-- **Composer** — `Enter` sends, `Shift+Enter` makes a newline.
+Pilot tests drive the real Textual app headless against the live API
+(they spend credits and take several minutes each):
 
-`Ctrl+S` switches sessions, `Ctrl+Q` quits. Data is stored in
-`~/.local/share/messy-team/messy.db`.
+```bash
+python tests/pilot_smoke.py     # session, streaming reply, restart
+python tests/pilot_agents.py    # agents, DMs, groups, @routing
+python tests/pilot_tools.py     # tool loop, permissions, tool cards
+python tests/pilot_relay.py     # agent-to-agent relay chains
+python tests/pilot_manager.py   # autonomous manager: spawn + delegate
+python tests/pilot_polish.py    # /model picker, /balance
+```
 
 ## License
 
-MIT — see [LICENSE](LICENSE).
+[MIT](LICENSE)

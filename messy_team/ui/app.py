@@ -30,7 +30,7 @@ from ..db import Database
 from ..ollama import ApiError, OllamaClient
 from ..permissions import ASK, ALLOW, DENY, Permissions
 from ..tools import ToolError, ToolExecutor
-from .modals import AgentManagerModal, GroupModal, PermissionModal, SessionModal
+from .modals import AgentManagerModal, AgentModal, GroupModal, PermissionModal, SessionModal
 from .widgets import MessageView, StreamingMessage, ToolCard
 
 
@@ -77,6 +77,7 @@ class MessyTeamApp(App[None]):
     .msg .thinking.live { color: $warning; }
     .msg.errored .body { color: $error; }
     .notice { color: $warning; margin: 1 2; }
+    .msg MarkdownFence { background: $surface; border: round $surface-lighten-2; }
     """
 
     BINDINGS = [
@@ -95,7 +96,25 @@ class MessyTeamApp(App[None]):
         self.session_id: int | None = None
         self.chat_id: int | None = None
         self._open_stream: StreamingMessage | None = None
+        self._models: list[str] | None = None
         self.permissions = Permissions()
+
+    @property
+    def models_cache(self) -> list[str] | None:
+        """Cloud model names from /api/tags, or None until the first fetch."""
+        return self._models
+
+    async def _refresh_models(self, modal=None) -> None:
+        """Fetch /api/tags once; attach the result to a live AgentModal."""
+        if self._models is None:
+            try:
+                self._models = await self._require_client().list_models()
+            except ApiError:
+                self._models = []
+            except Exception:
+                self._models = []
+        if modal is not None and self.screen is modal:
+            modal.set_models(self._models or [])
 
     # -- client ------------------------------------------------------------
 
@@ -360,11 +379,71 @@ class MessyTeamApp(App[None]):
             self._new_group()
         elif command == "sessions":
             self.action_sessions()
+        elif command == "model":
+            self._open_model_picker()
+        elif command == "balance":
+            self.run_worker(self._balance_worker(), exclusive=True)
         else:
             self._render_notice(
-                f"Unknown command /{command} — try /agents, /group, /sessions"
+                f"Unknown command /{command} — try /agents, /group, /model,"
+                " /balance, /sessions"
             )
         return True
+
+    def _open_model_picker(self) -> None:
+        """/model: edit the current chat's agent (pick or type the model)."""
+        if self.chat_id is None:
+            self.notify("Open a chat first", severity="warning")
+            return
+        chat = self.db.get_chat(self.chat_id)
+        agent = self.db.chat_agent(self.chat_id) if chat["kind"] == "dm" else None
+        if agent is None:
+            self.notify("/model works in a direct chat — /agents lists everyone",
+                        severity="warning")
+            return
+        self.push_screen(
+            AgentModal(agent=agent, default_model=self.config.worker_model,
+                       models=self._models),
+            self._on_agent_edit,
+        )
+        if self._models is None:
+            self.run_worker(self._refresh_models(self.screen), exclusive=True)
+
+    async def _balance_worker(self) -> None:
+        try:
+            data = await self._require_client().balance()
+        except ApiError as error:
+            self._render_notice(f"Balance unavailable: {error}")
+            return
+        try:
+            included = data.get("included") or {}
+            purchased = data.get("purchased") or {}
+            parts = []
+            if isinstance(included, dict) and "balance_usd" in included:
+                text = f"${float(included['balance_usd']):.2f}"
+                if "allowance_usd" in included:
+                    text += f" of ${float(included['allowance_usd']):.2f} plan credits"
+                period = included.get("period") or {}
+                if isinstance(period, dict) and period.get("until"):
+                    text += f" until {str(period['until'])[:10]}"
+                parts.append(text)
+            elif isinstance(included, dict):
+                # Legacy plans: included.session / included.weekly percentages.
+                for label in ("session", "weekly"):
+                    sub = included.get(label)
+                    if isinstance(sub, dict) and "remaining_percent" in sub:
+                        text = (f"{label} plan: "
+                                f"{float(sub['remaining_percent']):.0f}% remaining")
+                        if sub.get("resets_at"):
+                            text += f" (resets {str(sub['resets_at'])[:10]})"
+                        parts.append(text)
+            if isinstance(purchased, dict) and "balance_usd" in purchased:
+                parts.append(f"${float(purchased['balance_usd']):.2f} purchased")
+            self._render_notice(
+                "Balance: " + (" · ".join(parts) if parts else json.dumps(data)[:200])
+            )
+        except Exception:
+            self._render_notice("Balance: " + json.dumps(data)[:200])
 
     def _route_responders(self, chat, user_text: str) -> list:
         """Pick who answers: DM → its agent; group → @mentions, else the manager."""
